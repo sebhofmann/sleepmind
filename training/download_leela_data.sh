@@ -1,8 +1,11 @@
 #!/bin/bash
-# Lädt die externen Stockfish-Trainingsdaten (Leela-Partien, mit BT4 neu bewertet) von
-# Hugging Face, Auswahl aus vondele/nettest threats.yaml, ~195 GB:
-#   test80 2023 (alle 12 Monate) + 2024 jan/feb, test80 2022 nov,
-#   T60T70wIsRightFarseer split_0, tb5dtm (Tablebase-Endspiele)
+# Lädt die externen Stockfish-Trainingsdaten (Leela-Partien) von Hugging Face, ~320 GB:
+#   aus vondele/nettest threats.yaml (mit BT4 neu bewertet, ~195 GB):
+#     test80 2023 (alle 12 Monate) + 2024 jan/feb, test80 2022 nov,
+#     T60T70wIsRightFarseer split_0, tb5dtm (Tablebase-Endspiele)
+#   dazu (nicht in nettest):
+#     test80 2024 mär-jun, BT4-relabelt (histfix), ~45 GB
+#     test91 2026 jan-mai (Leela T91), roh mit Leelas eigenen Werten, nicht minimiert, ~81 GB
 # Nicht genommen: sf-searchtree (keine Partieergebnisse, ply 9999), dfrc (Chess960),
 # die .q.binpack-Varianten und die älteren test60/77/78/79-Monate.
 # Fortsetzbar: bereits vollständige Dateien werden übersprungen, halbe mit curl -C - fortgesetzt.
@@ -32,6 +35,15 @@ FILES=(
     vondele/linrock_relabel_1/test80-2022-11-nov-16tb7p.v6-dd.min.relabel-BT4-tf13tune.binpack
     vondele/from_kaggle_2_relabel/T60T70wIsRightFarseerT60T74T75T76.split_0.relabel-BT4-tf13tune.binpack
     vondele/rescored/tb5dtm.binpack
+    xushawn/test80-bt4-relabel/test80-2024-03-mar-2tb7p.min-v2.v6.relabel-BT4-tf13tune-histfix.binpack
+    xushawn/test80-bt4-relabel/test80-2024-04-apr-2tb7p.min-v2.v6.relabel-BT4-tf13tune-histfix.binpack
+    xushawn/test80-bt4-relabel/test80-2024-05-may-2tb7p.min-v2.v6.relabel-BT4-tf13tune-histfix.binpack
+    xushawn/test80-bt4-relabel/test80-2024-06-jun-2tb7p.min-v2.v6.relabel-BT4-tf13tune-histfix.binpack
+    xushawn/t91-binpacks-raw-old/test91-2026-01-jan-69gb6p.binpack
+    xushawn/t91-binpacks-raw-old/test91-2026-02-feb-69gb6p.binpack
+    xushawn/t91-binpacks-raw-old/test91-2026-03-mar-69gb6p.binpack
+    xushawn/t91-binpacks-raw-old/test91-2026-04-apr-69gb6p.binpack
+    xushawn/t91-binpacks-raw-old/test91-2026-05-may-69gb6p.binpack
 )
 
 for entry in "${FILES[@]}"; do
