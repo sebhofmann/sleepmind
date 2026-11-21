@@ -108,8 +108,7 @@ const STAGE2_WDL: f32 = 1.0;
 const SF_WDL_CYCLE_DELTA: f32 = 0.3;
 const SF_WDL_CYCLE_WARMUP: f32 = 0.25;
 const SF_STAGE2_WDL: f32 = 0.0;
-const SF_BUFFER_MB: usize = 2048;
-const SF_THREADS: usize = 8;
+const SF_THREADS: usize = 12;
 
 /// Result weight of the reference's lambda cycle over stages 0 and 1 together.
 #[derive(Clone, Debug)]
@@ -272,7 +271,7 @@ fn main() {
     assert!(sf_paths.is_empty() || (bullet_paths.is_empty() && viri_paths.is_empty()), "--sf excludes -d/--viri");
     if sf_stats {
         assert!(!sf_paths.is_empty(), "--sf-stats needs --sf");
-        let loader = SfLoader::new(&sf_paths, SF_BUFFER_MB, SF_THREADS, EVAL_SCALE);
+        let loader = SfLoader::new(&sf_paths, SF_THREADS, EVAL_SCALE);
         loader.print_stats(4000);
         // loader throughput (training needs ~2.6M positions/s)
         let start = std::time::Instant::now();
@@ -280,8 +279,10 @@ fn main() {
         loader.read_chunks(0, |chunk| {
             n += chunk.len();
             buffers += 1;
-            println!("loader: {:.2}M positions/s", n as f64 / start.elapsed().as_secs_f64() / 1e6);
-            buffers == 3
+            if buffers % 50 == 0 {
+                println!("loader: {:.2}M positions/s", n as f64 / start.elapsed().as_secs_f64() / 1e6);
+            }
+            buffers == 300
         });
         return;
     }
@@ -423,7 +424,7 @@ fn main() {
     ];
 
     let reader = if sf {
-        let loader = SfLoader::new(&sf_paths, SF_BUFFER_MB, SF_THREADS, EVAL_SCALE);
+        let loader = SfLoader::new(&sf_paths, SF_THREADS, EVAL_SCALE);
         loader.print_stats(400);
         Reader::Sf(loader)
     } else {

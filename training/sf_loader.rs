@@ -50,25 +50,29 @@ const OUT_OFFSET: f64 = 289.1258344152218;
 // Piece-count resampling discards many positions; switch off to keep more data.
 pub const PIECE_COUNT_FILTER: bool = true;
 
-/// Chunks per message from the file reader to the workers.
-const CHUNKS_PER_JOB: usize = 16;
+// Pipeline sizes as in the reference (data_loader/cpp/lib/parallel_dataloader.h):
+// workers decode one chunk per claim, fill shuffle windows of 2^20 positions, and
+// up to 16 sealed windows wait for the trainer. Small windows keep the flow steady
+// instead of long decode bursts followed by idle phases.
+const CHUNKS_PER_JOB: usize = 1;
+const CHUNK_QUEUE: usize = 256;
+pub const SHUFFLE_WINDOW: usize = 1 << 20;
+const READY_WINDOWS: usize = 16;
 
 #[derive(Clone)]
 pub struct SfLoader {
     paths: Vec<String>,
-    buffer_size: usize,
     threads: usize,
     eval_scale: f32,
 }
 
 impl SfLoader {
-    pub fn new(paths: &[String], buffer_mb: usize, threads: usize, eval_scale: f32) -> Self {
+    pub fn new(paths: &[String], threads: usize, eval_scale: f32) -> Self {
         for path in paths {
             assert!(std::path::Path::new(path).exists(), "File not found: {path}");
         }
         Self {
             paths: paths.to_vec(),
-            buffer_size: buffer_mb * 1024 * 1024 / std::mem::size_of::<ChessBoard>(),
             threads: threads.max(1),
             eval_scale,
         }
@@ -119,7 +123,7 @@ impl DataReader<ChessBoard> for SfLoader {
         let stop = Arc::new(AtomicBool::new(false));
 
         // 1. file reader: draws the next chunk from a random file (weighted by remaining bytes)
-        let (job_tx, job_rx) = mpsc::sync_channel::<Vec<Vec<u8>>>(4 * self.threads);
+        let (job_tx, job_rx) = mpsc::sync_channel::<Vec<Vec<u8>>>(CHUNK_QUEUE / CHUNKS_PER_JOB);
         let paths = self.paths.clone();
         let reader_stop = stop.clone();
         std::thread::spawn(move || {
@@ -180,7 +184,7 @@ impl DataReader<ChessBoard> for SfLoader {
                         Ok(job) => job,
                         Err(_) => break,
                     };
-                    let mut out = Vec::with_capacity(job.len() * 4096);
+                    let mut out = Vec::with_capacity(job.len() * 32768);
                     for chunk in &job {
                         let mut cr = ChunkReader::default();
                         while cr.has_next(chunk) {
@@ -198,19 +202,26 @@ impl DataReader<ChessBoard> for SfLoader {
         }
         drop(pos_tx);
 
-        // 3. shuffle buffer
-        let buffer_size = self.buffer_size;
-        let mut buffer = Vec::with_capacity(buffer_size);
-        'outer: while let Ok(positions) = pos_rx.recv() {
-            for p in positions {
-                buffer.push(p);
-                if buffer.len() == buffer_size {
-                    shuffle(&mut buffer);
-                    if f(&buffer) {
-                        break 'outer;
+        // 3. shuffle windows: filled and shuffled on their own thread, handed over FIFO
+        let (buf_tx, buf_rx) = mpsc::sync_channel::<Vec<ChessBoard>>(READY_WINDOWS);
+        std::thread::spawn(move || {
+            let mut window = Vec::with_capacity(SHUFFLE_WINDOW);
+            while let Ok(positions) = pos_rx.recv() {
+                for p in positions {
+                    window.push(p);
+                    if window.len() == SHUFFLE_WINDOW {
+                        shuffle(&mut window);
+                        if buf_tx.send(std::mem::replace(&mut window, Vec::with_capacity(SHUFFLE_WINDOW))).is_err() {
+                            return;
+                        }
                     }
-                    buffer.clear();
                 }
+            }
+        });
+
+        while let Ok(buffer) = buf_rx.recv() {
+            if f(&buffer) {
+                break;
             }
         }
         stop.store(true, Ordering::Relaxed);
