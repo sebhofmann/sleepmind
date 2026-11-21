@@ -47,9 +47,12 @@ use bullet_trainer::{
 use std::{env, sync::Arc};
 
 mod mixed_loader;
+mod sf_loader;
 mod threat_inputs;
 mod viri_filter;
+use bullet_trainer::reader::DataReader;
 use mixed_loader::MixedLoader;
+use sf_loader::SfLoader;
 use viri_filter::{VIRI_BUFFER_MB, VIRI_THREADS, should_keep};
 
 // Must match NNUE_SCALE in src/nnue.h
@@ -97,6 +100,58 @@ const STAGE1_WDL_END: f32 = 0.5;
 const STAGE2_LR_START: f32 = 1e-5;
 const STAGE2_LR_END: f32 = 1e-7;
 const STAGE2_WDL: f32 = 1.0;
+
+// --sf (Stockfish binpacks, external data with BT4 scores): WDL like the reference
+// (nettest threats.yaml: start/end lambda 1.0, lambda-cycle-delta -0.3, warmup 25 %):
+// the result weight rises along a cosine to 0.3 within the first 25 % of stages 0+1
+// and falls back to 0 at their end. Finetuning (stage 2) uses the scores only.
+const SF_WDL_CYCLE_DELTA: f32 = 0.3;
+const SF_WDL_CYCLE_WARMUP: f32 = 0.25;
+const SF_STAGE2_WDL: f32 = 0.0;
+const SF_BUFFER_MB: usize = 2048;
+const SF_THREADS: usize = 8;
+
+/// Result weight of the reference's lambda cycle over stages 0 and 1 together.
+#[derive(Clone, Debug)]
+struct CycleWDL {
+    /// superbatches of earlier stages within the cycle
+    offset: usize,
+    /// length of the cycle in superbatches (stage 0 + stage 1)
+    total: usize,
+}
+
+impl wdl::WdlScheduler for CycleWDL {
+    fn blend(&self, batch: usize, superbatch: usize, _max: usize) -> f32 {
+        let pos = (self.offset + superbatch - 1) as f32 + batch as f32 / (6104 / 8) as f32;
+        let warmup = SF_WDL_CYCLE_WARMUP * self.total as f32;
+        let cos = if pos < warmup {
+            0.5 * (1.0 - (std::f32::consts::PI * pos / warmup).cos())
+        } else {
+            0.5 * (1.0 + (std::f32::consts::PI * (pos - warmup) / (self.total as f32 - warmup)).cos())
+        };
+        SF_WDL_CYCLE_DELTA * cos.clamp(0.0, 1.0)
+    }
+
+    fn colourful(&self) -> String {
+        format!("cycle 0 -> {SF_WDL_CYCLE_DELTA} -> 0 over {} SBs", self.total)
+    }
+}
+
+/// Training data: our own formats or external Stockfish binpacks.
+#[derive(Clone)]
+enum Reader {
+    Mixed(MixedLoader),
+    Sf(SfLoader),
+}
+
+impl DataReader<ChessBoard> for Reader {
+    fn read_chunks<F: FnMut(&[ChessBoard]) -> bool>(&self, skip: usize, f: F) {
+        match self {
+            Reader::Mixed(r) => r.read_chunks(skip, f),
+            Reader::Sf(r) => r.read_chunks(skip, f),
+        }
+    }
+}
 
 type InputTy = (((((SparseInput, SparseInput), SparseInput), SparseInput), SparseInput), DenseInput<f32>);
 
@@ -155,13 +210,24 @@ fn main() {
     let mut threads: u8 = 6;
     let mut save_rate: usize = 10;
     let mut eval_fens: Option<String> = None;
+    let mut no_finetune = false;
+    let mut sf_paths: Vec<String> = Vec::new();
+    let mut sf_stats = false;
 
     let mut i = 1;
     while i < args.len() {
         let next = |i: usize| args.get(i + 1).cloned().unwrap_or_default();
+        // flags without a value
+        if args[i] == "--no-finetune" || args[i] == "--sf-stats" {
+            no_finetune |= args[i] == "--no-finetune";
+            sf_stats |= args[i] == "--sf-stats";
+            i += 1;
+            continue;
+        }
         match args[i].as_str() {
             "--data" | "-d" => bullet_paths.push(next(i)),
             "--viri" => viri_paths.push(next(i)),
+            "--sf" => sf_paths.push(next(i)),
             "--viri-fraction" => {
                 viri_fraction = Some(next(i).parse().expect("--viri-fraction must be a number in [0, 1]"))
             }
@@ -180,8 +246,13 @@ fn main() {
                 println!("      --viri <PATH>        viriformat binpack (whole games), repeatable; filtered in the loader");
                 println!("      --viri-fraction <F>  share of viriformat positions per batch when mixing with --data");
                 println!("                           (default: proportional to the number of positions)");
+                println!("      --sf <PATH>          Stockfish binpack (external data), repeatable; not combinable");
+                println!("                           with -d/--viri. Filter and score target as in nnue-pytorch/nettest");
+                println!("      --sf-stats           With --sf: print filter pass rate and positions per pass, exit");
                 println!("  -s, --superbatches <N>   Total superbatches over all 3 stages (default: 1100)");
                 println!("                           split ~1/11 warmup, ~8/11 main, ~2/11 finetune");
+                println!("      --no-finetune        Stop after the main stage: same split, stage 2 is skipped");
+                println!("                           (-s 660 then trains 60 + 480 superbatches)");
                 println!("      --start-stage <N>    Stage to start in: 0, 1 or 2 (default: 0)");
                 println!("      --start <N>          Start superbatch within the start stage (default: 1)");
                 println!("  -r, --resume <DIR>       Load full optimiser state, e.g.");
@@ -197,7 +268,25 @@ fn main() {
         i += 2;
     }
     assert!(start_stage <= 2, "--start-stage must be 0, 1 or 2");
-    if bullet_paths.is_empty() && viri_paths.is_empty() && eval_fens.is_none() {
+    assert!(!(no_finetune && start_stage == 2), "--no-finetune and --start-stage 2 exclude each other");
+    assert!(sf_paths.is_empty() || (bullet_paths.is_empty() && viri_paths.is_empty()), "--sf excludes -d/--viri");
+    if sf_stats {
+        assert!(!sf_paths.is_empty(), "--sf-stats needs --sf");
+        let loader = SfLoader::new(&sf_paths, SF_BUFFER_MB, SF_THREADS, EVAL_SCALE);
+        loader.print_stats(4000);
+        // loader throughput (training needs ~2.6M positions/s)
+        let start = std::time::Instant::now();
+        let (mut n, mut buffers) = (0usize, 0);
+        loader.read_chunks(0, |chunk| {
+            n += chunk.len();
+            buffers += 1;
+            println!("loader: {:.2}M positions/s", n as f64 / start.elapsed().as_secs_f64() / 1e6);
+            buffers == 3
+        });
+        return;
+    }
+    let sf = !sf_paths.is_empty();
+    if bullet_paths.is_empty() && viri_paths.is_empty() && !sf && eval_fens.is_none() {
         bullet_paths.push("data/baseline.data".to_string());
     }
 
@@ -213,8 +302,15 @@ fn main() {
     for path in &viri_paths {
         println!("Dataset:   {path} (viriformat)");
     }
+    for path in &sf_paths {
+        println!("Dataset:   {path} (sfbinpack)");
+    }
     println!("Network:   {net_id}  (768x{INPUT_BUCKETS} + {} threats/pawn pairs -> {L1} pairwise -> {L2} -> {L3} -> 1, {OUTPUT_BUCKETS} out buckets)", threat_inputs::NUM_INPUTS);
-    println!("Stages:    0: {stage0_sbs} SBs (warmup), 1: {stage1_sbs} SBs (main), 2: {stage2_sbs} SBs (finetune)");
+    if no_finetune {
+        println!("Stages:    0: {stage0_sbs} SBs (warmup), 1: {stage1_sbs} SBs (main), 2: skipped (--no-finetune)");
+    } else {
+        println!("Stages:    0: {stage0_sbs} SBs (warmup), 1: {stage1_sbs} SBs (main), 2: {stage2_sbs} SBs (finetune)");
+    }
     println!("Start:     stage {start_stage}, superbatch {start_superbatch}");
     if let Some(r) = &resume {
         println!("Resume:    {r}");
@@ -326,7 +422,14 @@ fn main() {
         SavedFormat::id("l3/b").round().quantise::<i32>(i32::from(Q).pow(4)),
     ];
 
-    let reader = MixedLoader::new(&bullet_paths, &viri_paths, should_keep, VIRI_BUFFER_MB, VIRI_THREADS, viri_fraction);
+    let reader = if sf {
+        let loader = SfLoader::new(&sf_paths, SF_BUFFER_MB, SF_THREADS, EVAL_SCALE);
+        loader.print_stats(400);
+        Reader::Sf(loader)
+    } else {
+        Reader::Mixed(MixedLoader::new(&bullet_paths, &viri_paths, should_keep, VIRI_BUFFER_MB, VIRI_THREADS, viri_fraction))
+    };
+    let cycle_sbs = stage0_sbs + stage1_sbs;
 
     let mut run = |stage: usize, end_superbatch: usize, lr_schedule, mapper| {
         let start = if stage == start_stage { start_superbatch } else { 1 };
@@ -377,7 +480,11 @@ fn main() {
                 first_scheduler_final_superbatch: warmup_sbs,
             }
             .boxed(),
-            make_mapper(&inputs, tables.clone(), wdl::ConstantWDL { value: STAGE0_WDL }),
+            if sf {
+                make_mapper(&inputs, tables.clone(), CycleWDL { offset: 0, total: cycle_sbs })
+            } else {
+                make_mapper(&inputs, tables.clone(), wdl::ConstantWDL { value: STAGE0_WDL })
+            },
         );
     }
 
@@ -387,8 +494,16 @@ fn main() {
             stage1_sbs,
             lr::LinearDecayLR { initial_lr: STAGE1_LR_START, final_lr: STAGE1_LR_END, final_superbatch: stage1_sbs }
                 .boxed(),
-            make_mapper(&inputs, tables.clone(), wdl::LinearWDL { start: STAGE1_WDL_START, end: STAGE1_WDL_END }),
+            if sf {
+                make_mapper(&inputs, tables.clone(), CycleWDL { offset: stage0_sbs, total: cycle_sbs })
+            } else {
+                make_mapper(&inputs, tables.clone(), wdl::LinearWDL { start: STAGE1_WDL_START, end: STAGE1_WDL_END })
+            },
         );
+    }
+
+    if no_finetune {
+        return;
     }
 
     run(
@@ -396,6 +511,6 @@ fn main() {
         stage2_sbs,
         lr::LinearDecayLR { initial_lr: STAGE2_LR_START, final_lr: STAGE2_LR_END, final_superbatch: stage2_sbs }
             .boxed(),
-        make_mapper(&inputs, tables.clone(), wdl::ConstantWDL { value: STAGE2_WDL }),
+        make_mapper(&inputs, tables.clone(), wdl::ConstantWDL { value: if sf { SF_STAGE2_WDL } else { STAGE2_WDL } }),
     );
 }
