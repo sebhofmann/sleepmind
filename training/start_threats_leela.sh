@@ -3,8 +3,8 @@
 # vondele/nettest, siehe download_leela_data.sh). Filter und Score-Ziel wie nnue-pytorch/nettest
 # (sf_loader.rs), WDL-Zyklus 0 -> 0.3 -> 0 wie dort (lambda-cycle).
 #
-# Start:   ./start_threats_leela.sh            (SUPERBATCHES=2200 NO_FINETUNE=1 voreingestellt)
-# Endnetz: stage1-<n> (ohne Finetune; bei 2200: 200 Warmup + 1600 Hauptstufe = 1800 SBs, ~20 h)
+# Start:   ./start_threats_leela.sh            (SUPERBATCHES=1600 NO_FINETUNE=1 voreingestellt)
+# Endnetz: stage1-1164 (ohne Finetune; bei 1600: 145 Warmup + 1164 Hauptstufe = 1309 SBs, ~14 h)
 # quantised_threats.bin im Repo bleibt unverändert (INSTALL_NET=0), nur die Variante bekommt das Netz.
 # Startet keinen SPRT.
 set -euo pipefail
@@ -12,7 +12,7 @@ set -euo pipefail
 ROOT=/home/paschty/workspace/sleepmind2
 DATA=${DATA:-$ROOT/training_data/leela}
 VARIANT=${VARIANT:-threats_leela}
-SUPERBATCHES=${SUPERBATCHES:-2200}
+SUPERBATCHES=${SUPERBATCHES:-1600}
 NO_FINETUNE=${NO_FINETUNE:-1}
 LOG=$ROOT/training/pipeline_$VARIANT.log
 
