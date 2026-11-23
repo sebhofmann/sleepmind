@@ -10,6 +10,7 @@ on:
       - "Makefile"
       - "quantised.bin"
       - "quantised_deep.bin"
+      - "quantised_threats.bin"
       - "src/**"
   workflow_dispatch:
 

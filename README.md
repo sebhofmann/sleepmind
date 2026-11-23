@@ -1,5 +1,20 @@
 # SleepMind 2
 
+## Networks
+
+Up to 23 November 2026 all of SleepMind's networks were trained on positions
+from SleepMind's own self-play games. The last commit with a network trained
+on its own data is `91bcc74` (deep net `deep_gen13`, still built with
+`make NNUE_ARCH=deep`).
+
+The current default network (`quantised_threats.bin`, `NNUE_ARCH=threats`)
+was trained on external data only: Leela Chess Zero games from the test80
+runs (2022–2024) plus older T60/T70 games and 5-man tablebase positions,
+rescored with BT4 and shipped as Stockfish binpacks, as
+listed in [vondele/nettest](https://github.com/vondele/nettest). The data
+selection is in `training/download_leela_data.sh`, the loader and its filters
+in `training/sf_loader.rs`, the run in `training/start_threats_leela.sh`.
+
 ## Release binaries
 
 Pushing a tag matching `v*` builds and publishes self-contained binaries for

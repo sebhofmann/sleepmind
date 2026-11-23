@@ -7,21 +7,28 @@
 #include <stdalign.h>
 #include <stddef.h>
 
-// NNUE architecture, selected at compile time (make NNUE_ARCH=legacy|deep, default deep):
+// NNUE architecture, selected at compile time (make NNUE_ARCH=legacy|deep|threats, default threats):
 //   NNUE_ARCH_LEGACY: (768x10 -> HIDDEN)x2 -> SCReLU -> 1, 8 output buckets  (training/training.rs)
 //   NNUE_ARCH_DEEP:   (768x16 -> 768)x2 -> pairwise CReLU -> 16 -> [x, x^2] -> 32 -> 1,
 //                     8 output buckets on every layer                          (training/training_deep.rs)
+//   NNUE_ARCH_THREATS: deep, plus threat and pawn-pair inputs (i8, see nnue_threats.h) added to the
+//                     FT accumulator before the pairwise CReLU                (training/training_threats.rs)
 // A net only loads into a build of the matching architecture (checked via file size).
 #define NNUE_ARCH_LEGACY     0
 #define NNUE_ARCH_DEEP       1
+#define NNUE_ARCH_THREATS    2
 #ifndef NNUE_ARCH
-#define NNUE_ARCH            NNUE_ARCH_DEEP
+#define NNUE_ARCH            NNUE_ARCH_THREATS
 #endif
+// Architectures sharing the deep output stack (pairwise CReLU -> L1 -> L2 -> L3)
+#define NNUE_IS_DEEP         (NNUE_ARCH == NNUE_ARCH_DEEP || NNUE_ARCH == NNUE_ARCH_THREATS)
 
 // Net file of this build (set by the Makefile per architecture)
 #ifndef NNUE_EMBED_FILE
 #if NNUE_ARCH == NNUE_ARCH_DEEP
 #define NNUE_EMBED_FILE      "quantised_deep.bin"
+#elif NNUE_ARCH == NNUE_ARCH_THREATS
+#define NNUE_EMBED_FILE      "quantised_threats.bin"
 #else
 #define NNUE_EMBED_FILE      "quantised.bin"
 #endif
@@ -30,7 +37,7 @@
 #define NNUE_INPUT_SIZE      768   // 64 squares * 6 piece types * 2 colors
 #define NNUE_OUTPUT_BUCKETS  8     // Output buckets (material count)
 
-#if NNUE_ARCH == NNUE_ARCH_DEEP
+#if NNUE_IS_DEEP
 #define NNUE_HIDDEN_SIZE     768   // FT width per perspective (pairwise -> 384 per perspective)
 #define NNUE_INPUT_BUCKETS   16    // King position buckets
 #define NNUE_L1_IN           NNUE_HIDDEN_SIZE   // 2 perspectives x HIDDEN/2
@@ -55,6 +62,10 @@
 #define NNUE_QA              255   // Feature transformer weight quantization
 #define NNUE_QB              64    // Legacy: output layer weight quantization
 #define NNUE_Q               64    // Deep: L2/L3 weight quantization
+#if NNUE_ARCH == NNUE_ARCH_THREATS
+#include "nnue_threats.h"
+#endif
+
 #ifndef NNUE_SCALE
 #define NNUE_SCALE           295   // Final output scale (must match bullet's eval_scale)
 #endif
@@ -76,6 +87,21 @@ typedef struct NNUEAccumulator {
     int capture_sq;
     int white_king_sq;
     int black_king_sq;
+#if NNUE_ARCH == NNUE_ARCH_THREATS
+    // Threat + pawn-pair part of the FT, kept apart from white/black (PSQT + bias) so the Finny table
+    // stays PSQT-only; both are summed (saturating) before the activation. As in pawnocchio the
+    // threat/pawn-pair changes of the move into this frame are recorded as a delta (lazily, see
+    // nnue_note_threat_move), and on eval every pending frame is materialised from its parent; a
+    // perspective whose king mirror state changed is rebuilt from the board.
+    alignas(64) int16_t tp[2][NNUE_HIDDEN_SIZE];
+    NNUETPDelta tp_delta;     // changes of the move into this frame (valid if tp_state == recorded)
+    int8_t tp_state;          // NNUE_TP_STATE_*
+    int8_t tp_mask[2];        // square mask of each perspective in this frame's position (recorded / computed)
+    // the move into this frame while tp_state == pending (see nnue_note_threat_move)
+    uint8_t tp_move_from, tp_move_to, tp_move_piece, tp_move_captured, tp_move_capture_sq;
+    bool tp_move_castling;
+    bool tp_computed[2];
+#endif
 } NNUEAccumulator;
 
 // NNUE Network weights (separate from accumulator, can be loaded from file)
@@ -83,10 +109,15 @@ typedef struct NNUEAccumulator {
 typedef struct {
     // Feature transformer weights: [INPUT_BUCKETS][INPUT_SIZE][HIDDEN_SIZE]
     alignas(64) int16_t ft_weights[NNUE_INPUT_BUCKETS][NNUE_INPUT_SIZE][NNUE_HIDDEN_SIZE];
-    // Feature transformer biases: [HIDDEN_SIZE]
+#if NNUE_ARCH == NNUE_ARCH_THREATS
+    // Threat + pawn-pair weights (bullet l0/pp/w, i8 x QA): [feature][HIDDEN_SIZE]; SIMD builds
+    // interleave and bias every 32-value block at load time (tp_interleave_weights in nnue.c)
+    alignas(64) int8_t tp_weights[NNUE_TP_INPUTS][NNUE_HIDDEN_SIZE];
+#endif
+    // Feature transformer biases: [HIDDEN_SIZE] (threats arch: bullet l0/pp/b)
     alignas(64) int16_t ft_biases[NNUE_HIDDEN_SIZE];
 
-#if NNUE_ARCH == NNUE_ARCH_DEEP
+#if NNUE_IS_DEEP
     // L1: i8, [bucket][out][in], in = stm pairwise (HIDDEN/2) | ntm pairwise (HIDDEN/2), scale 2^14 with biases
     alignas(64) int8_t l1_weights[NNUE_OUTPUT_BUCKETS][NNUE_L2_SIZE][NNUE_L1_IN];
     alignas(64) int32_t l1_biases[NNUE_OUTPUT_BUCKETS][NNUE_L2_SIZE];
@@ -113,6 +144,32 @@ typedef struct {
 
     bool loaded;
 } NNUENetwork;
+
+#if NNUE_ARCH == NNUE_ARCH_THREATS
+#define NNUE_TP_STATE_NONE      0   // no usable delta: rebuild from the board
+#define NNUE_TP_STATE_PREPARED  1   // fresh child frame, waiting for its move
+#define NNUE_TP_STATE_RECORDED  2   // tp_delta holds the move's changes
+#define NNUE_TP_STATE_PENDING   3   // the move is noted, its changes are not recorded yet
+
+// Notes the move just made into a prepared child frame (pieces as enum Piece, captured_piece
+// NO_PIECE if none, capture_sq differs from `to` only for en passant). The threat/pawn-pair changes
+// are recorded lazily from the board after the move: when the frame is evaluated, or right before
+// the next move is made from it (nnue_flush_parent_threat_move). Frames that are neither evaluated
+// nor searched further (illegal moves, early cutoffs) never pay for the recording.
+void nnue_note_threat_move(NNUEAccumulator* acc, int from, int to, int moving_piece, int captured_piece,
+                           int capture_sq, bool castling);
+
+// To be called by applyMove before the board changes: records the pending move of child's parent
+// frame, whose position the board still holds.
+void nnue_record_pending_threat_move(NNUEAccumulator* frame, const Board* board, const NNUENetwork* net);
+static inline void nnue_flush_parent_threat_move(NNUEAccumulator* child, const Board* board,
+                                                 const NNUENetwork* net) {
+    if (child->tp_state == NNUE_TP_STATE_PREPARED && child->previous != NULL &&
+        child->previous->tp_state == NNUE_TP_STATE_PENDING) {
+        nnue_record_pending_threat_move(child->previous, board, net);
+    }
+}
+#endif
 
 // Global network instance (deprecated - weights now in NNUEAccumulator)
 extern NNUENetwork nnue_net;
