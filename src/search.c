@@ -38,6 +38,7 @@ static _Thread_local struct {
     uint64_t razoring;
     uint64_t futility;
     uint64_t lmp;
+    uint64_t history_pruning;
     uint64_t improving_nodes;
     uint64_t non_improving_nodes;
     uint64_t lmp_improving;
@@ -145,10 +146,16 @@ void search_params_init(SearchParams* params) {
     params->use_iir = true;
     params->use_probcut = true;
     params->use_singular = true;
+    params->use_history_pruning = true;
 
     // Late Move Pruning: skip quiets after base + depth^2 searched moves
     params->lmp_base = 6;
     params->lmp_max_depth = 8;
+
+    // Conservative shallow pruning of quiets with strongly negative combined
+    // butterfly and continuation history.
+    params->history_pruning_max_depth = 4;
+    params->history_pruning_margin = 4000;
 
     params->main_capture_see_margin = 100;
     params->main_capture_see_max_depth = 16;
@@ -1541,6 +1548,8 @@ static int negamax(Board* board, int depth, int alpha, int beta, SearchInfo* inf
         depth <= 3 && abs(alpha) < TB_SCORE_MIN && abs(beta) < TB_SCORE_MIN;
     bool can_lmp = info->params.use_lmp && !is_pv && !in_check &&
         depth <= info->params.lmp_max_depth && abs(alpha) < TB_SCORE_MIN;
+    bool can_history_prune = info->params.use_history_pruning && ply > 0 &&
+        !in_check && depth <= info->params.history_pruning_max_depth;
     // Conservative main-search capture SEE pruning. Root/PV/check nodes and
     // mate/TB windows are exempt because speculative material pruning must not
     // hide principal variations, evasions, or proven high-magnitude scores.
@@ -1801,6 +1810,16 @@ static int negamax(Board* board, int depth, int alpha, int beta, SearchInfo* inf
             } else {
                 PRUNING_STAT_INC(lmp_non_improving);
             }
+            continue;
+        }
+
+        // History Pruning: the staged picker already computed this quiet's
+        // combined butterfly + continuation score. Once one legal move has
+        // been searched, very low-history quiets can be skipped safely without
+        // making a legal position look like mate or stalemate.
+        if (can_history_prune && !is_tactical && moves_searched > 0 &&
+            move_score < -info->params.history_pruning_margin * depth) {
+            PRUNING_STAT_INC(history_pruning);
             continue;
         }
 
@@ -2423,7 +2442,8 @@ Move search_iterate(Board* board, SearchInfo* info) {
         // Print pruning statistics
         uint64_t total_prunings = pruning_stats.null_move + pruning_stats.reverse_futility +
                                   pruning_stats.razoring + pruning_stats.futility +
-                                  pruning_stats.lmp + pruning_stats.lmr +
+                                  pruning_stats.lmp + pruning_stats.history_pruning +
+                                  pruning_stats.lmr +
                                   pruning_stats.delta + pruning_stats.see_pruning +
                                   pruning_stats.probcut_cuts;
         total_prunings += pruning_stats.main_capture_see;
@@ -2434,6 +2454,7 @@ Move search_iterate(Board* board, SearchInfo* info) {
         printf("info string   Razoring:     %llu\n", (unsigned long long)pruning_stats.razoring);
         printf("info string   Futility:     %llu\n", (unsigned long long)pruning_stats.futility);
         printf("info string   LMP:          %llu\n", (unsigned long long)pruning_stats.lmp);
+        printf("info string   History:      %llu\n", (unsigned long long)pruning_stats.history_pruning);
         printf("info string Improving nodes: yes=%llu no=%llu\n",
                (unsigned long long)pruning_stats.improving_nodes,
                (unsigned long long)pruning_stats.non_improving_nodes);
